@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小红书自动跳转App
 // @namespace    xhs-auto-open
-// @version      3.3
-// @description  Android/iOS 手机端自动打开小红书App查看笔记、用户主页；完美净化安全拦截参数防转圈；完整提取并保留 xsec_token 等鉴权参数；全自动穿透“当前内容仅支持在小红书APP内查看”拦截页与原生 Universal Link 兜底
+// @version      3.4
+// @description  Android/iOS 手机端自动打开小红书App查看笔记、用户主页；点击打开App后自动秒关当前标签页；完美净化安全拦截参数防转圈；完整提取并保留 xsec_token 等鉴权参数；全自动穿透“当前内容仅支持在小红书APP内查看”拦截页与原生 Universal Link 兜底
 // @author       RatedR9 & Antigravity
 // @match        *://www.xiaohongshu.com/*
 // @match        *://xiaohongshu.com/*
@@ -12,13 +12,40 @@
 // @match        *://rednote.com/*
 // @match        *://*.rednote.com/*
 // @run-at       document-start
-// @grant        none
+// @grant        window.close
+// @grant        unsafeWindow
 // ==/UserScript==
 
 (function () {
   'use strict';
 
+  const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   let hasNavigated = false;
+  let isClosing = false;
+
+  // ── 0. 安全关闭当前标签页 ───────────────────────────────────────────────────
+  function safeCloseTab() {
+    if (isClosing) return;
+    isClosing = true;
+
+    // 0.1 Tampermonkey 赋予的高权限 window.close()
+    try {
+      window.close();
+    } catch (_) {}
+
+    // 0.2 原生页面上下文 close
+    try {
+      if (typeof unsafeWindow !== 'undefined' && unsafeWindow.close) {
+        unsafeWindow.close();
+      }
+    } catch (_) {}
+
+    // 0.3 移动端浏览器沙箱逃逸兜底
+    try {
+      window.open('', '_self', '');
+      window.close();
+    } catch (_) {}
+  }
 
   // ── 1. 深度提取 Target (Note ID / User ID) ─────────────────────────────────
   function extractTarget() {
@@ -44,7 +71,7 @@
 
     // 1.4 从 window.__INITIAL_STATE__ 恢复
     try {
-      const state = window.__INITIAL_STATE__ || window.__INITIAL_SSR_STATE__;
+      const state = win.__INITIAL_STATE__ || win.__INITIAL_SSR_STATE__ || window.__INITIAL_STATE__;
       if (state) {
         if (state.note?.currentNoteId) return { type: 'note', id: state.note.currentNoteId };
         if (state.noteData?.data?.noteData?.id) return { type: 'note', id: state.noteData.data.noteData.id };
@@ -84,7 +111,7 @@
 
     // 2.2 从 window.__INITIAL_STATE__ 提取参数
     try {
-      const state = window.__INITIAL_STATE__ || window.__INITIAL_SSR_STATE__;
+      const state = win.__INITIAL_STATE__ || win.__INITIAL_SSR_STATE__ || window.__INITIAL_STATE__;
       if (state) {
         const origUrl = state.noteData?.routeQuery?.originalUrl ||
                         state.noteData?.routeQuery?.redirectPath ||
@@ -160,7 +187,7 @@
       if (location.pathname.includes('/video/') || location.search.includes('type=video')) {
         isVideo = true;
       }
-      const state = window.__INITIAL_STATE__ || window.__INITIAL_SSR_STATE__;
+      const state = win.__INITIAL_STATE__ || win.__INITIAL_SSR_STATE__ || window.__INITIAL_STATE__;
       if (state?.noteData?.data?.noteData?.type === 'video' || state?.noteData?.note?.type === 'video') {
         isVideo = true;
       }
@@ -176,8 +203,8 @@
     return `https://oia.xiaohongshu.com/oia?deeplink=${encodeURIComponent(deepLink)}`;
   }
 
-  // ── 4. 稳健唤起（兼容 Android 各类浏览器与 WebView） ───────────────────────
-  function executeNavigation(deepLink) {
+  // ── 4. 稳健唤起（兼容 Android 各类浏览器与 WebView，并自动关闭标签页） ──
+  function executeNavigation(deepLink, autoClose = false) {
     if (!deepLink) return;
 
     try {
@@ -187,9 +214,26 @@
         window.location.href = deepLink;
       } catch (_) {}
     }
+
+    if (autoClose) {
+      // 1. 延时定时器触发关闭（预留 700ms 让操作系统 Intent / URL Scheme 完成唤起派发）
+      setTimeout(() => {
+        safeCloseTab();
+      }, 700);
+
+      // 2. 页面进入后台（App 成功切出前台瞬间）立即秒关当前标签
+      const onHidden = () => {
+        if (document.hidden) {
+          safeCloseTab();
+          document.removeEventListener('visibilitychange', onHidden);
+        }
+      };
+      document.addEventListener('visibilitychange', onHidden);
+      window.addEventListener('pagehide', safeCloseTab, { once: true });
+    }
   }
 
-  // ── 5. 自动穿透拦截页与官方按钮模拟 ───────────────────────────────────────
+  // ── 5. 自动穿透拦截页与官方按钮模拟（接管点击并触发关闭） ───────────────
   function triggerNativeLaunch() {
     const target = extractTarget();
     const deepLink = target ? buildDeepLink(target) : '';
@@ -205,11 +249,11 @@
 
       if (match || isXhs) {
         if (deepLink) {
-          // 接管原生按钮点击，直接发射清洗后的 deepLink
+          // 接管原生按钮点击，直接发射清洗后的 deepLink，并附带点击后关闭标签页
           node.onclick = (e) => {
             e.preventDefault();
             e.stopPropagation();
-            executeNavigation(deepLink);
+            executeNavigation(deepLink, true);
           };
         }
         try {
@@ -221,7 +265,7 @@
     return false;
   }
 
-  // ── 6. 注入快捷免转圈辅助条 ────────────────────────────────────────────────
+  // ── 6. 注入快捷免转圈辅助条（附带一键唤起+自动关页） ────────────────────
   function injectHelperBar(target) {
     if (!target || target.type !== 'note') return;
     if (document.getElementById('xhs-auto-jump-banner')) return;
@@ -260,10 +304,10 @@
       </div>
       <div style="display:flex; gap:8px;">
         <button id="xhs-btn-open-app" style="flex:1; height:38px; border:none; border-radius:10px; background:#fff; color:#ff2442; font-size:13px; font-weight:bold; cursor:pointer;">
-          📱 直接在 App 内打开
+          📱 打开 App 并关页
         </button>
         <button id="xhs-btn-search-app" style="flex:1; height:38px; border:1px solid rgba(255,255,255,0.7); border-radius:10px; background:transparent; color:#fff; font-size:13px; font-weight:bold; cursor:pointer;">
-          🔍 App 内精准搜索(免转圈)
+          🔍 精准搜索(免转圈)
         </button>
       </div>
     `;
@@ -271,8 +315,16 @@
     document.body.appendChild(banner);
 
     document.getElementById('xhs-banner-close')?.addEventListener('click', () => banner.remove());
-    document.getElementById('xhs-btn-open-app')?.addEventListener('click', () => executeNavigation(deepLink || uLink));
-    document.getElementById('xhs-btn-search-app')?.addEventListener('click', () => executeNavigation(searchScheme));
+    document.getElementById('xhs-btn-open-app')?.addEventListener('click', () => {
+      const btn = document.getElementById('xhs-btn-open-app');
+      if (btn) btn.textContent = '🚀 打开中并关闭...';
+      executeNavigation(deepLink || uLink, true);
+    });
+    document.getElementById('xhs-btn-search-app')?.addEventListener('click', () => {
+      const btn = document.getElementById('xhs-btn-search-app');
+      if (btn) btn.textContent = '🔍 搜索中并关闭...';
+      executeNavigation(searchScheme, true);
+    });
   }
 
   // ── 7. 核心触发逻辑 ───────────────────────────────────────────────────────
@@ -285,13 +337,22 @@
 
     if (!hasNavigated) {
       hasNavigated = true;
-      executeNavigation(deepLink);
+      executeNavigation(deepLink, false);
+
+      // 若自动唤起成功触发了页面退火（切换到小红书 App），则无感秒关标签页
+      const onAutoHidden = () => {
+        if (document.hidden) {
+          safeCloseTab();
+          document.removeEventListener('visibilitychange', onAutoHidden);
+        }
+      };
+      document.addEventListener('visibilitychange', onAutoHidden);
     }
   }
 
   // ── 8. 多阶段执行生命周期 ─────────────────────────────────────────────────
 
-  // 8.1 阶段一：document-start 立即触发（趁浏览器页面跳转上下文活跃，成功率最高）
+  // 8.1 阶段一：document-start 立即触发
   tryWakeup();
 
   // 8.2 阶段二：DOM 变化监听与定时轮询（当页面出现拦截页或异步注入参数时再次激活）
@@ -319,7 +380,7 @@
       subtree: true
     });
 
-    // 梯度定时器轮询
+    // 梯度定时器轮询接管按钮
     [30, 100, 300, 700, 1500].forEach(delay => {
       setTimeout(() => {
         tryWakeup();
@@ -329,7 +390,7 @@
       }, delay);
     });
 
-    // 8.3 用户手势代理拦截：如果浏览器策略拦截了自动跳转，用户点击屏幕任何位置均可直接秒开 App
+    // 8.3 用户手势代理拦截：如果浏览器策略拦截了自动跳转，用户点击屏幕任何位置均可直接秒开 App 并关闭
     const handleUserGesture = () => {
       tryWakeup();
       triggerNativeLaunch();
