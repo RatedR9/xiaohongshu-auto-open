@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小红书自动跳转App
 // @namespace    xhs-auto-open
-// @version      3.4
-// @description  Android/iOS 手机端自动打开小红书App查看笔记、用户主页；点击打开App后自动秒关当前标签页；完美净化安全拦截参数防转圈；完整提取并保留 xsec_token 等鉴权参数；全自动穿透“当前内容仅支持在小红书APP内查看”拦截页与原生 Universal Link 兜底
+// @version      3.5
+// @description  Android/iOS 手机端自动打开小红书App查看笔记、用户主页；全自动模拟点击秒开APP无需手动点击；完美净化安全拦截参数防转圈；完整提取并保留 xsec_token 等鉴权参数；全自动穿透“当前内容仅支持在小红书APP内查看”拦截页与原生 Universal Link 兜底并自动关闭当前标签页
 // @author       RatedR9 & Antigravity
 // @match        *://www.xiaohongshu.com/*
 // @match        *://xiaohongshu.com/*
@@ -20,8 +20,9 @@
   'use strict';
 
   const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  let hasNavigated = false;
   let isClosing = false;
+  let autoNavigated = false;
+  let autoClickedNative = false;
 
   // ── 0. 安全关闭当前标签页 ───────────────────────────────────────────────────
   function safeCloseTab() {
@@ -45,6 +46,25 @@
       window.open('', '_self', '');
       window.close();
     } catch (_) {}
+  }
+
+  // 监听切到后台后自动秒关当前标签页
+  function setupAppSwitchCloser() {
+    const onAppSwitched = () => {
+      if (document.hidden) {
+        safeCloseTab();
+        document.removeEventListener('visibilitychange', onAppSwitched);
+      }
+    };
+    document.addEventListener('visibilitychange', onAppSwitched);
+    window.addEventListener('pagehide', safeCloseTab, { once: true });
+
+    // 延时兜底关页（针对部分浏览器切换后台不触发 visibilitychange 的情况）
+    setTimeout(() => {
+      if (document.hidden) {
+        safeCloseTab();
+      }
+    }, 1800);
   }
 
   // ── 1. 深度提取 Target (Note ID / User ID) ─────────────────────────────────
@@ -203,69 +223,102 @@
     return `https://oia.xiaohongshu.com/oia?deeplink=${encodeURIComponent(deepLink)}`;
   }
 
-  // ── 4. 稳健唤起（兼容 Android 各类浏览器与 WebView，并自动关闭标签页） ──
-  function executeNavigation(deepLink, autoClose = false) {
-    if (!deepLink) return;
-
+  // ── 4. 全事件模拟点击引擎（突破移动端 Touch / Pointer 监听限制） ─────────
+  function simulateFullClick(element) {
+    if (!element) return;
     try {
-      window.location.replace(deepLink);
+      const rect = element.getBoundingClientRect();
+      const x = rect.left + rect.width / 2;
+      const y = rect.top + rect.height / 2;
+
+      // 4.1 Pointer Events
+      try {
+        element.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+        element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+      } catch (_) {}
+
+      // 4.2 Touch Events (针对移动端 Vue/React 绑定的 touchstart/touchend)
+      try {
+        if (typeof Touch !== 'undefined' && typeof TouchEvent !== 'undefined') {
+          const touch = new Touch({ identifier: Date.now(), target: element, clientX: x, clientY: y, screenX: x, screenY: y });
+          element.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, cancelable: true, touches: [touch], targetTouches: [touch], changedTouches: [touch] }));
+          element.dispatchEvent(new TouchEvent('touchend', { bubbles: true, cancelable: true, touches: [], targetTouches: [], changedTouches: [touch] }));
+        }
+      } catch (_) {}
+
+      // 4.3 Mouse Events & Native Click
+      try {
+        element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+        element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, clientX: x, clientY: y }));
+      } catch (_) {}
+
+      element.click();
     } catch (_) {
       try {
-        window.location.href = deepLink;
+        element.click();
       } catch (_) {}
     }
-
-    if (autoClose) {
-      // 1. 延时定时器触发关闭（预留 700ms 让操作系统 Intent / URL Scheme 完成唤起派发）
-      setTimeout(() => {
-        safeCloseTab();
-      }, 700);
-
-      // 2. 页面进入后台（App 成功切出前台瞬间）立即秒关当前标签
-      const onHidden = () => {
-        if (document.hidden) {
-          safeCloseTab();
-          document.removeEventListener('visibilitychange', onHidden);
-        }
-      };
-      document.addEventListener('visibilitychange', onHidden);
-      window.addEventListener('pagehide', safeCloseTab, { once: true });
-    }
   }
 
-  // ── 5. 自动穿透拦截页与官方按钮模拟（接管点击并触发关闭） ───────────────
-  function triggerNativeLaunch() {
+  // ── 5. 核心：全自动无感直达引擎（无需手动点击） ─────────────────────────
+  function tryAutoNavigate() {
+    if (autoNavigated) return;
     const target = extractTarget();
-    const deepLink = target ? buildDeepLink(target) : '';
+    if (!target) return;
+
+    const deepLink = buildDeepLink(target);
+    if (!deepLink) return;
+
+    const uLink = buildUniversalLink(deepLink);
+    autoNavigated = true;
+
+    // 5.1 隐式创建 <a> 标签击发 Universal Link（HTTPS 协议，手机浏览器绝对放行）
+    try {
+      const a = document.createElement('a');
+      a.href = uLink || deepLink;
+      a.rel = 'noopener';
+      a.style.display = 'none';
+      (document.body || document.documentElement).appendChild(a);
+      a.click();
+      setTimeout(() => a.remove(), 1000);
+    } catch (_) {}
+
+    // 5.2 location 导航双向注入
+    try {
+      if (uLink) {
+        window.location.href = uLink;
+      } else {
+        window.location.replace(deepLink);
+      }
+    } catch (_) {}
+
+    setupAppSwitchCloser();
+  }
+
+  // 自动搜寻页面上的“打开 APP 查看” / “小红书 App内打开”原生按钮并自动击发
+  function tryAutoClickNative() {
+    if (autoClickedNative) return;
 
     const targetTexts = ['打开 APP 查看', 'App内打开', '打开APP查看', '打开 App 查看', '立即打开'];
-    const candidates = document.querySelectorAll('button, a, div[role="button"], [class*="open"], [class*="btn"], [class*="bottom-btn"]');
+    const candidates = document.querySelectorAll('button, div[class*="bottom-btn"], .bottom-btn, .reds-button, a');
 
-    for (const node of candidates) {
-      const text = (node.textContent || '').trim();
-      const match = targetTexts.some(t => text.includes(t));
-      const href = node.getAttribute?.('href') || '';
-      const isXhs = href.startsWith('xhsdiscover://');
-
-      if (match || isXhs) {
-        if (deepLink) {
-          // 接管原生按钮点击，直接发射清洗后的 deepLink，并附带点击后关闭标签页
-          node.onclick = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            executeNavigation(deepLink, true);
-          };
-        }
-        try {
-          node.click();
-          return true;
-        } catch (_) {}
+    for (const el of candidates) {
+      const txt = (el.textContent || '').trim();
+      if (targetTexts.some(t => txt.includes(t))) {
+        autoClickedNative = true;
+        simulateFullClick(el);
+        setupAppSwitchCloser();
+        break;
       }
     }
-    return false;
   }
 
-  // ── 6. 注入快捷免转圈辅助条（附带一键唤起+自动关页） ────────────────────
+  function autoOpen() {
+    tryAutoNavigate();
+    tryAutoClickNative();
+  }
+
+  // ── 6. 注入轻量状态辅助条（自动打开状态提示与手动兜底） ─────────────────
   function injectHelperBar(target) {
     if (!target || target.type !== 'note') return;
     if (document.getElementById('xhs-auto-jump-banner')) return;
@@ -299,12 +352,12 @@
 
     banner.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-size:14px; font-weight:600; letter-spacing:0.3px;">⚡ 小红书自动跳转助手</span>
+        <span style="font-size:14px; font-weight:600; letter-spacing:0.3px;">⚡ 正在自动秒开 App 并关闭页面...</span>
         <span id="xhs-banner-close" style="font-size:16px; cursor:pointer; opacity:0.8; padding:0 4px;">✕</span>
       </div>
       <div style="display:flex; gap:8px;">
         <button id="xhs-btn-open-app" style="flex:1; height:38px; border:none; border-radius:10px; background:#fff; color:#ff2442; font-size:13px; font-weight:bold; cursor:pointer;">
-          📱 打开 App 并关页
+          📱 再次打开 App
         </button>
         <button id="xhs-btn-search-app" style="flex:1; height:38px; border:1px solid rgba(255,255,255,0.7); border-radius:10px; background:transparent; color:#fff; font-size:13px; font-weight:bold; cursor:pointer;">
           🔍 精准搜索(免转圈)
@@ -318,61 +371,41 @@
     document.getElementById('xhs-btn-open-app')?.addEventListener('click', () => {
       const btn = document.getElementById('xhs-btn-open-app');
       if (btn) btn.textContent = '🚀 打开中并关闭...';
-      executeNavigation(deepLink || uLink, true);
+      autoNavigated = false;
+      tryAutoNavigate();
+      tryAutoClickNative();
     });
     document.getElementById('xhs-btn-search-app')?.addEventListener('click', () => {
       const btn = document.getElementById('xhs-btn-search-app');
       if (btn) btn.textContent = '🔍 搜索中并关闭...';
-      executeNavigation(searchScheme, true);
+      try {
+        window.location.href = searchScheme;
+      } catch (_) {}
+      setupAppSwitchCloser();
     });
   }
 
-  // ── 7. 核心触发逻辑 ───────────────────────────────────────────────────────
-  function tryWakeup() {
-    const target = extractTarget();
-    if (!target) return;
+  // ── 7. 多阶段执行生命周期 ─────────────────────────────────────────────────
 
-    const deepLink = buildDeepLink(target);
-    if (!deepLink) return;
+  // 7.1 阶段一：document-start 立即触发（趁跳转上下文活跃直接拉起）
+  autoOpen();
 
-    if (!hasNavigated) {
-      hasNavigated = true;
-      executeNavigation(deepLink, false);
-
-      // 若自动唤起成功触发了页面退火（切换到小红书 App），则无感秒关标签页
-      const onAutoHidden = () => {
-        if (document.hidden) {
-          safeCloseTab();
-          document.removeEventListener('visibilitychange', onAutoHidden);
-        }
-      };
-      document.addEventListener('visibilitychange', onAutoHidden);
-    }
-  }
-
-  // ── 8. 多阶段执行生命周期 ─────────────────────────────────────────────────
-
-  // 8.1 阶段一：document-start 立即触发
-  tryWakeup();
-
-  // 8.2 阶段二：DOM 变化监听与定时轮询（当页面出现拦截页或异步注入参数时再次激活）
+  // 7.2 阶段二：DOM 变化监听与定时梯度轮询（一旦拦截按钮出现立即自动模拟点击）
   function setupDomWatchers() {
     const target = extractTarget();
     if (target) {
       injectHelperBar(target);
     }
 
-    // 监听 DOM 树
+    autoOpen();
+
+    // 监听 DOM 树（只要拦截页文字或按钮挂载，立即全自动触发点击）
     const observer = new MutationObserver(() => {
       const curTarget = extractTarget();
       if (curTarget) {
         injectHelperBar(curTarget);
       }
-      // 只要页面存在拦截文案或按钮，立即再次提取并接管
-      if (document.body && document.body.textContent.includes('小红书 APP 内查看')) {
-        tryWakeup();
-        triggerNativeLaunch();
-      }
+      autoOpen();
     });
 
     observer.observe(document.documentElement || document.body, {
@@ -380,20 +413,18 @@
       subtree: true
     });
 
-    // 梯度定时器轮询接管按钮
-    [30, 100, 300, 700, 1500].forEach(delay => {
+    // 梯度毫秒级轮询，确保在 React/Vue 渲染出的第一毫秒内直接自动点击！
+    [20, 50, 100, 200, 400, 800, 1500].forEach(delay => {
       setTimeout(() => {
-        tryWakeup();
-        triggerNativeLaunch();
+        autoOpen();
         const t = extractTarget();
         if (t) injectHelperBar(t);
       }, delay);
     });
 
-    // 8.3 用户手势代理拦截：如果浏览器策略拦截了自动跳转，用户点击屏幕任何位置均可直接秒开 App 并关闭
+    // 7.3 用户手势安全代理：点击屏幕任何地方均作为备用兜底
     const handleUserGesture = () => {
-      tryWakeup();
-      triggerNativeLaunch();
+      autoOpen();
     };
     document.addEventListener('click', handleUserGesture, true);
     document.addEventListener('touchend', handleUserGesture, true);
